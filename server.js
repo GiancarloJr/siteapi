@@ -87,7 +87,7 @@ app.post("/produtos", async (req, res) => {
 });
 
 /**
- * PATCH /produtos/:id → atualiza campos específicos
+ * PATCH /produtos/:id → atualiza campos específicosa
  */
 app.patch("/produtos/:id", async (req, res) => {
   try {
