@@ -2,6 +2,9 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import pkg from "pg";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+
 const { Pool } = pkg;
 
 dotenv.config();
@@ -10,51 +13,99 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "15mb" })); 
 app.use((req, res, next) => {
-  const apiKey = req.headers["x-api-key"]; // cabeçalho personalizado
-  const expectedKey = process.env.API_KEY;
+  // Libera login
+  if (req.path === "/auth/login") return next();
 
-  // Só exige API key para métodos que modificam dados
+  // Só protege rotas que alteram dados
   const isProtected =
+    req.method === "GET" ||
     req.method === "POST" ||
     req.method === "PATCH" ||
     req.method === "DELETE";
 
-  if (isProtected && apiKey !== expectedKey) {
-    return res.status(401).json({ error: "Acesso não autorizado" });
-  }
+  if (!isProtected) return next();
 
-  next();
+  // Valida JWT
+  const auth = req.headers["authorization"] || "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ error: "Token ausente" });
+
+  try {
+    const payload = verifyToken(match[1]);
+    if (payload?.role !== "admin") {
+      return res.status(403).json({ error: "Sem permissão" });
+    }
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token inválido ou expirado" });
+  }
 });
 
-// 🧠 conexão com o banco
+
+// conexão com o banco
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// ✅ verifica conexão inicial
+// verifica conexão inicial
 pool.connect()
-  .then(() => console.log("✅ Conectado ao PostgreSQL!"))
-  .catch(err => console.error("❌ Erro ao conectar:", err));
+  .then(() => console.log("Conectado ao PostgreSQL!"))
+  .catch(err => console.error("Erro ao conectar:", err));
 
 // ------------------- ROTAS -------------------
 
 /**
- * GET /produtos → lista todos
+ * POST /auth/login
+ * body: { email, senha }
+ * retorno: { token, user }
  */
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { email, senha } = req.body || {};
+    if (!email || !senha) {
+      return res.status(400).json({ error: "Email e senha são obrigatórios" });
+    }
+
+    const { rows } = await pool.query(
+      "SELECT id, email, password_hash FROM usuarios_admin WHERE email = $1",
+      [email]
+    );
+    if (!rows.length) return res.status(401).json({ error: "Credenciais inválidas" });
+
+    const user = rows[0];
+    const ok = await bcrypt.compare(senha, user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Credenciais inválidas" });
+
+    const token = signToken({ sub: user.id, email: user.email, role: "admin" });
+    return res.json({
+      token,
+      user: { id: user.id, email: user.email }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Erro ao autenticar" });
+  }
+});
+
 app.get("/produtos", async (_req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM produtos ORDER BY id DESC");
-    res.json(result.rows);
+    const { rows } = await pool.query(
+      `SELECT p.id, p.titulo, p.preco, p.descricao, p.tamanhos, p.imagem_base64,
+              p.valor_formatado, p.href, p.categoria_id,
+              c.nome AS categoria_nome
+         FROM produtos p
+    LEFT JOIN categorias c ON c.id = p.categoria_id
+        ORDER BY p.id DESC`
+    );
+    res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro ao buscar produtos" });
   }
 });
 
-/**
- * GET /produtos/:id → busca 1
- */
 app.get("/produtos/:id", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM produtos WHERE id=$1", [req.params.id]);
@@ -66,9 +117,6 @@ app.get("/produtos/:id", async (req, res) => {
   }
 });
 
-/**
- * POST /produtos → cria
- */
 app.post("/produtos", async (req, res) => {
   try {
     const { titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href } = req.body;
@@ -86,9 +134,6 @@ app.post("/produtos", async (req, res) => {
   }
 });
 
-/**
- * PATCH /produtos/:id → atualiza campos específicosa
- */
 app.patch("/produtos/:id", async (req, res) => {
   try {
     const id = req.params.id;
@@ -116,9 +161,37 @@ app.patch("/produtos/:id", async (req, res) => {
   }
 });
 
-/**
- * DELETE /produtos/:id → remove
- */
+app.get("/categorias/:id/produtos", async (req, res) => {
+  try {
+    const categoriaId = req.params.id;
+
+    // opcional: verifica se categoria existe
+    const cat = await pool.query("SELECT * FROM categorias WHERE id = $1", [categoriaId]);
+    if (cat.rows.length === 0) {
+      return res.status(404).json({ error: "Categoria não encontrada" });
+    }
+
+    // busca produtos daquela categoria
+    const produtos = await pool.query(
+      `SELECT p.*, c.nome AS categoria
+       FROM produtos p
+       JOIN categorias c ON p.categoria_id = c.id
+       WHERE c.id = $1
+       ORDER BY p.id DESC`,
+      [categoriaId]
+    );
+
+    res.json({
+      categoria: cat.rows[0],
+      produtos: produtos.rows
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao buscar produtos da categoria" });
+  }
+});
+
 app.delete("/produtos/:id", async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM produtos WHERE id=$1 RETURNING *", [req.params.id]);
@@ -129,6 +202,32 @@ app.delete("/produtos/:id", async (req, res) => {
     res.status(500).json({ error: "Erro ao deletar produto" });
   }
 });
+
+app.get("/categorias", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nome, path, href
+         FROM categorias
+        ORDER BY id ASC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao buscar categorias" });
+  }
+});
+
+
+function signToken(payload) {
+  const secret = process.env.JWT_SECRET;
+  return jwt.sign(payload, secret, { expiresIn: "2h" });
+}
+
+function verifyToken(token) {
+  const secret = process.env.JWT_SECRET;
+  return jwt.verify(token, secret);
+}
+
 
 // ------------------- INICIALIZA -------------------
 
