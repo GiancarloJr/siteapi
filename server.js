@@ -10,11 +10,42 @@ const { Pool } = pkg;
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "15mb" })); 
+
+/** 🔒 Configuração do CORS */
+const ALLOWED_ORIGINS = [
+  "https://sitefabi.vercel.app",
+  "http://localhost:4200"
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS: Origin não permitido"));
+    }
+  },
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type", "x-api-key"],
+  maxAge: 86400, // cache do preflight (24h)
+};
+
+
+app.use(cors(corsOptions));
+
+app.options("*", cors(corsOptions));
+
 app.use((req, res, next) => {
-  // Libera login
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+app.use(express.json({ limit: "15mb" }));
+app.use((req, res, next) => {
   if (req.path === "/auth/login") return next();
+  if (req.method === "OPTIONS") return next();
 
   // Só protege rotas que alteram dados
   const isProtected =
