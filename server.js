@@ -150,20 +150,58 @@ app.get("/produtos/:id", async (req, res) => {
 
 app.post("/produtos", async (req, res) => {
   try {
-    const { titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href } = req.body;
+    const {
+      titulo,
+      preco,
+      descricao,
+      tamanhos,
+      imagem_base64,
+      valor_formatado,
+      href,
+      categoria_id,
+    } = req.body;
+
+    // validação básica
+    if (!titulo || categoria_id == null) {
+      return res.status(400).json({ error: "Título e categoria_id são obrigatórios." });
+    }
+
+    // (opcional) validar existência da categoria
+    const { rows: catRows } = await pool.query(
+      "SELECT 1 FROM categorias WHERE id = $1",
+      [categoria_id]
+    );
+    if (catRows.length === 0) {
+      return res.status(400).json({ error: "Categoria inexistente." });
+    }
+
+    // garantir array de tamanhos (ou null)
+    const tamanhosArray = Array.isArray(tamanhos) ? tamanhos : null;
 
     const result = await pool.query(
-      `INSERT INTO produtos (titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href]
+      `INSERT INTO produtos (
+         titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id`,
+      [titulo, preco, descricao, tamanhosArray, imagem_base64, valor_formatado, href, categoria_id]
     );
 
-    res.status(201).json(result.rows[0]);
+    // se quiser já devolver a categoria junto, faça um JOIN após inserir:
+    const { rows } = await pool.query(
+      `SELECT p.*, c.nome AS categoria_nome, c.href AS categoria_href, c.path AS categoria_path
+         FROM produtos p
+         JOIN categorias c ON c.id = p.categoria_id
+        WHERE p.id = $1`,
+      [result.rows[0].id]
+    );
+
+    res.status(201).json(rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro ao criar produto" });
   }
 });
+
 
 app.patch("/produtos/:id", async (req, res) => {
   try {
