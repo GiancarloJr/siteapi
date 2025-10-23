@@ -124,8 +124,8 @@ app.get("/produtos", async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT p.id, p.titulo, p.preco, p.descricao, p.tamanhos, p.imagem_base64,
-              p.valor_formatado, p.href, p.categoria_id,
-              c.nome AS categoria_nome
+              p.valor_formatado, p.href, p.categoria_id, 
+              c.nome AS categoria_nome, p.ativo
          FROM produtos p
     LEFT JOIN categorias c ON c.id = p.categoria_id
         ORDER BY p.id DESC`
@@ -261,14 +261,32 @@ app.get("/categorias/:id/produtos", async (req, res) => {
   }
 });
 
-app.delete("/produtos/:id", async (req, res) => {
+app.patch('/produtos/:id/ativo', async (req, res) => {
+  const id = Number(req.params.id);
+  const { ativo } = req.body; // boolean
   try {
-    const result = await pool.query("DELETE FROM produtos WHERE id=$1 RETURNING *", [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "Produto não encontrado" });
-    res.json({ message: "Produto removido com sucesso" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro ao deletar produto" });
+    const { rows } = await pool.query(
+      'UPDATE produtos SET ativo = $1 WHERE id = $2 RETURNING *',
+      [ativo, id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Não encontrado' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao alterar ativo' });
+  }
+});
+
+// DELETE /produtos/:id
+app.delete('/produtos/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  try {
+    const { rowCount } = await pool.query('DELETE FROM produtos WHERE id = $1', [id]);
+    if (!rowCount) return res.status(404).json({ error: 'Não encontrado' });
+    res.status(204).end();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao excluir' });
   }
 });
 
