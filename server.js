@@ -206,9 +206,31 @@ app.post("/produtos", async (req, res) => {
 app.patch("/produtos/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    const fields = ["titulo", "preco", "descricao", "tamanhos", "imagem_base64", "valor_formatado", "href"];
+    const fields = [
+      "titulo",
+      "preco",
+      "descricao",
+      "tamanhos",
+      "imagem_base64",
+      "valor_formatado",
+      "href",
+      "categoria_id"
+    ];
+
+
+    if (req.body.categoria_id !== undefined) {
+      const { rows: cat } = await pool.query(
+        "SELECT 1 FROM categorias WHERE id = $1",
+        [req.body.categoria_id]
+      );
+      if (!cat.length) {
+        return res.status(400).json({ error: "Categoria inexistente." });
+      }
+    }
+
     const set = [];
     const values = [];
+
     fields.forEach((f) => {
       if (req.body[f] !== undefined) {
         set.push(`${f}=$${values.length + 1}`);
@@ -219,14 +241,35 @@ app.patch("/produtos/:id", async (req, res) => {
     if (set.length === 0) return res.status(400).json({ error: "Nenhum campo para atualizar" });
 
     values.push(id);
-    const query = `UPDATE produtos SET ${set.join(", ")} WHERE id=$${values.length} RETURNING *`;
-    const result = await pool.query(query, values);
 
-    if (result.rows.length === 0) return res.status(404).json({ error: "Produto não encontrado" });
-    res.json(result.rows[0]);
+    const query = `
+      UPDATE produtos
+         SET ${set.join(", ")}
+       WHERE id = $${values.length}
+       RETURNING id, titulo, preco, descricao, tamanhos, imagem_base64,
+                 valor_formatado, href, categoria_id, ativo
+    `;
+    const updated = await pool.query(query, values);
+
+    if (!updated.rows.length) {
+      return res.status(404).json({ error: "Produto não encontrado" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT p.*,
+              c.nome AS categoria_nome,
+              c.href AS categoria_href,
+              c.path AS categoria_path
+         FROM produtos p
+    LEFT JOIN categorias c ON c.id = p.categoria_id
+        WHERE p.id = $1`,
+      [updated.rows[0].id]
+    );
+
+    return res.json(rows[0]);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Erro ao atualizar produto" });
+    return res.status(500).json({ error: "Erro ao atualizar produto" });
   }
 });
 
