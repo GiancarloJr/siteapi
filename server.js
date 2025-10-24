@@ -11,7 +11,6 @@ dotenv.config();
 
 const app = express();
 
-/** 🔒 Configuração do CORS */
 const ALLOWED_ORIGINS = [
   "https://sitefabi.vercel.app",
   "http://localhost:4200"
@@ -27,7 +26,7 @@ const corsOptions = {
   },
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Authorization", "Content-Type", "x-api-key"],
-  maxAge: 86400, // cache do preflight (24h)
+  maxAge: 86400, 
 };
 
 
@@ -47,16 +46,13 @@ app.use((req, res, next) => {
   if (req.path === "/auth/login") return next();
   if (req.method === "OPTIONS") return next();
 
-  // Só protege rotas que alteram dados
   const isProtected =
-    req.method === "GET" ||
     req.method === "POST" ||
     req.method === "PATCH" ||
     req.method === "DELETE";
 
   if (!isProtected) return next();
 
-  // Valida JWT
   const auth = req.headers["authorization"] || "";
   const match = auth.match(/^Bearer\s+(.+)$/i);
   if (!match) return res.status(401).json({ error: "Token ausente" });
@@ -73,14 +69,11 @@ app.use((req, res, next) => {
   }
 });
 
-
-// conexão com o banco
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// verifica conexão inicial
 pool.connect()
   .then(() => console.log("Conectado ao PostgreSQL!"))
   .catch(err => console.error("Erro ao conectar:", err));
@@ -275,34 +268,39 @@ app.patch("/produtos/:id", async (req, res) => {
 
 app.get("/categorias/:id/produtos", async (req, res) => {
   try {
-    const categoriaId = req.params.id;
-
-    // opcional: verifica se categoria existe
-    const cat = await pool.query("SELECT * FROM categorias WHERE id = $1", [categoriaId]);
-    if (cat.rows.length === 0) {
-      return res.status(404).json({ error: "Categoria não encontrada" });
+    const categoriaId = Number(req.params.id);
+    if (isNaN(categoriaId)) {
+      return res.status(400).json({ error: "ID de categoria inválido." });
     }
 
-    // busca produtos daquela categoria
-    const produtos = await pool.query(
-      `SELECT p.*, c.nome AS categoria
-       FROM produtos p
-       JOIN categorias c ON p.categoria_id = c.id
-       WHERE c.id = $1
-       ORDER BY p.id DESC`,
+    // verifica se a categoria existe
+    const catResult = await pool.query("SELECT * FROM categorias WHERE id = $1", [categoriaId]);
+    if (catResult.rows.length === 0) {
+      return res.status(404).json({ error: "Categoria não encontrada." });
+    }
+
+    // busca produtos dessa categoria
+    const prodResult = await pool.query(
+      `SELECT p.*, c.nome AS categoria_nome
+         FROM produtos p
+         JOIN categorias c ON p.categoria_id = c.id
+        WHERE c.id = $1
+     ORDER BY p.id DESC`,
       [categoriaId]
     );
 
-    res.json({
-      categoria: cat.rows[0],
-      produtos: produtos.rows
+    // resposta padronizada
+    return res.json({
+      categoria: catResult.rows[0],
+      produtos: prodResult.rows
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro ao buscar produtos da categoria" });
+    console.error("Erro em /categorias/:id/produtos:", err);
+    return res.status(500).json({ error: "Erro ao buscar produtos da categoria." });
   }
 });
+
 
 app.patch('/produtos/:id/ativo', async (req, res) => {
   const id = Number(req.params.id);
