@@ -4,6 +4,25 @@ import dotenv from "dotenv";
 import pkg from "pg";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import Redis from "ioredis";
+
+const REDIS_URL = process.env.CACHETOGO_TLS_URL || process.env.CACHETOGO_URL;
+
+const useTls = REDIS_URL?.startsWith("rediss://");
+export const redis = REDIS_URL
+  ? new Redis(REDIS_URL, useTls ? { tls: { rejectUnauthorized: false } } : {})
+  : null;
+
+if (redis) {
+  redis.on("connect", () => console.log("✅ Redis conectado"));
+  redis.on("error", (e) => console.error("❌ Redis erro:", e));
+} else {
+  console.warn(
+    "⚠️  Redis desativado (nenhuma REDIS_URL/CACHETOGO_* no ambiente)."
+  );
+}
+
+const redisKey = (k) => `camaleao:${k}`;
 
 const { Pool } = pkg;
 
@@ -13,7 +32,7 @@ const app = express();
 
 const ALLOWED_ORIGINS = [
   "https://sitefabi.vercel.app",
-  "http://localhost:4200"
+  "http://localhost:4200",
 ];
 
 const corsOptions = {
@@ -26,9 +45,8 @@ const corsOptions = {
   },
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Authorization", "Content-Type", "x-api-key"],
-  maxAge: 86400, 
+  maxAge: 86400,
 };
-
 
 app.use(cors(corsOptions));
 
@@ -47,9 +65,7 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return next();
 
   const isProtected =
-    req.method === "POST" ||
-    req.method === "PATCH" ||
-    req.method === "DELETE";
+    req.method === "POST" || req.method === "PATCH" || req.method === "DELETE";
 
   if (!isProtected) return next();
 
@@ -71,12 +87,13 @@ app.use((req, res, next) => {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
-pool.connect()
+pool
+  .connect()
   .then(() => console.log("Conectado ao PostgreSQL!"))
-  .catch(err => console.error("Erro ao conectar:", err));
+  .catch((err) => console.error("Erro ao conectar:", err));
 
 // ------------------- ROTAS -------------------
 
@@ -96,7 +113,8 @@ app.post("/auth/login", async (req, res) => {
       "SELECT id, email, password_hash FROM usuarios_admin WHERE email = $1",
       [email]
     );
-    if (!rows.length) return res.status(401).json({ error: "Credenciais inválidas" });
+    if (!rows.length)
+      return res.status(401).json({ error: "Credenciais inválidas" });
 
     const user = rows[0];
     const ok = await bcrypt.compare(senha, user.password_hash);
@@ -105,7 +123,7 @@ app.post("/auth/login", async (req, res) => {
     const token = signToken({ sub: user.id, email: user.email, role: "admin" });
     return res.json({
       token,
-      user: { id: user.id, email: user.email }
+      user: { id: user.id, email: user.email },
     });
   } catch (err) {
     console.error(err);
@@ -113,7 +131,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-app.get("/produtos", async (_req, res) => {
+app.get("/produtos", cache(60), async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT p.id, p.titulo, p.preco, p.descricao, p.tamanhos, p.imagem_base64,
@@ -130,10 +148,13 @@ app.get("/produtos", async (_req, res) => {
   }
 });
 
-app.get("/produtos/:id", async (req, res) => {
+app.get("/produtos/:id", cache(60), async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM produtos WHERE id=$1", [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "Produto não encontrado" });
+    const result = await pool.query("SELECT * FROM produtos WHERE id=$1", [
+      req.params.id,
+    ]);
+    if (result.rows.length === 0)
+      return res.status(404).json({ error: "Produto não encontrado" });
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -156,7 +177,9 @@ app.post("/produtos", async (req, res) => {
 
     // validação básica
     if (!titulo || categoria_id == null) {
-      return res.status(400).json({ error: "Título e categoria_id são obrigatórios." });
+      return res
+        .status(400)
+        .json({ error: "Título e categoria_id são obrigatórios." });
     }
 
     // (opcional) validar existência da categoria
@@ -176,7 +199,16 @@ app.post("/produtos", async (req, res) => {
          titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        RETURNING id, titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id`,
-      [titulo, preco, descricao, tamanhosArray, imagem_base64, valor_formatado, href, categoria_id]
+      [
+        titulo,
+        preco,
+        descricao,
+        tamanhosArray,
+        imagem_base64,
+        valor_formatado,
+        href,
+        categoria_id,
+      ]
     );
 
     // se quiser já devolver a categoria junto, faça um JOIN após inserir:
@@ -192,9 +224,10 @@ app.post("/produtos", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro ao criar produto" });
+  } finally {
+    invalidateProductsCache().catch(() => {});
   }
 });
-
 
 app.patch("/produtos/:id", async (req, res) => {
   try {
@@ -207,9 +240,8 @@ app.patch("/produtos/:id", async (req, res) => {
       "imagem_base64",
       "valor_formatado",
       "href",
-      "categoria_id"
+      "categoria_id",
     ];
-
 
     if (req.body.categoria_id !== undefined) {
       const { rows: cat } = await pool.query(
@@ -231,7 +263,8 @@ app.patch("/produtos/:id", async (req, res) => {
       }
     });
 
-    if (set.length === 0) return res.status(400).json({ error: "Nenhum campo para atualizar" });
+    if (set.length === 0)
+      return res.status(400).json({ error: "Nenhum campo para atualizar" });
 
     values.push(id);
 
@@ -263,10 +296,12 @@ app.patch("/produtos/:id", async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Erro ao atualizar produto" });
+  } finally {
+    invalidateProductsCache().catch(() => {});
   }
 });
 
-app.get("/categorias/:id/produtos", async (req, res) => {
+app.get("/categorias/:id/produtos", cache(300),async (req, res) => {
   try {
     const categoriaId = Number(req.params.id);
     if (isNaN(categoriaId)) {
@@ -274,12 +309,14 @@ app.get("/categorias/:id/produtos", async (req, res) => {
     }
 
     // verifica se a categoria existe
-    const catResult = await pool.query("SELECT * FROM categorias WHERE id = $1", [categoriaId]);
+    const catResult = await pool.query(
+      "SELECT * FROM categorias WHERE id = $1",
+      [categoriaId]
+    );
     if (catResult.rows.length === 0) {
       return res.status(404).json({ error: "Categoria não encontrada." });
     }
 
-    // busca produtos dessa categoria
     const prodResult = await pool.query(
       `SELECT p.*, c.nome AS categoria_nome
          FROM produtos p
@@ -292,46 +329,52 @@ app.get("/categorias/:id/produtos", async (req, res) => {
     // resposta padronizada
     return res.json({
       categoria: catResult.rows[0],
-      produtos: prodResult.rows
+      produtos: prodResult.rows,
     });
-
   } catch (err) {
     console.error("Erro em /categorias/:id/produtos:", err);
-    return res.status(500).json({ error: "Erro ao buscar produtos da categoria." });
+    return res
+      .status(500)
+      .json({ error: "Erro ao buscar produtos da categoria." });
   }
 });
 
-
-app.patch('/produtos/:id/ativo', async (req, res) => {
+app.patch("/produtos/:id/ativo", async (req, res) => {
   const id = Number(req.params.id);
   const { ativo } = req.body; // boolean
   try {
     const { rows } = await pool.query(
-      'UPDATE produtos SET ativo = $1 WHERE id = $2 RETURNING *',
+      "UPDATE produtos SET ativo = $1 WHERE id = $2 RETURNING *",
       [ativo, id]
     );
-    if (!rows.length) return res.status(404).json({ error: 'Não encontrado' });
+    if (!rows.length) return res.status(404).json({ error: "Não encontrado" });
     res.json(rows[0]);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Erro ao alterar ativo' });
+    res.status(500).json({ error: "Erro ao alterar ativo" });
+  } finally {
+    invalidateProductsCache().catch(() => {});
   }
 });
 
-// DELETE /produtos/:id
-app.delete('/produtos/:id', async (req, res) => {
+app.delete("/produtos/:id", async (req, res) => {
   const id = Number(req.params.id);
   try {
-    const { rowCount } = await pool.query('DELETE FROM produtos WHERE id = $1', [id]);
-    if (!rowCount) return res.status(404).json({ error: 'Não encontrado' });
+    const { rowCount } = await pool.query(
+      "DELETE FROM produtos WHERE id = $1",
+      [id]
+    );
+    if (!rowCount) return res.status(404).json({ error: "Não encontrado" });
     res.status(204).end();
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Erro ao excluir' });
+    res.status(500).json({ error: "Erro ao excluir" });
+  } finally {
+    invalidateProductsCache().catch(() => {});
   }
 });
 
-app.get("/categorias", async (_req, res) => {
+app.get("/categorias", cache(60), async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, nome, path, href
@@ -345,6 +388,16 @@ app.get("/categorias", async (_req, res) => {
   }
 });
 
+app.get("/test-redis", async (_req, res) => {
+  try {
+    if (!redis) return res.json({ ok: false, msg: "Redis OFF" });
+    await redis.set("ping", "pong", "EX", 30);
+    const val = await redis.get("ping");
+    res.json({ ok: true, val });
+  } catch (e) {
+    res.status(500).json({ ok: false, err: e.message });
+  }
+});
 
 function signToken(payload) {
   const secret = process.env.JWT_SECRET;
@@ -355,6 +408,55 @@ function verifyToken(token) {
   const secret = process.env.JWT_SECRET;
   return jwt.verify(token, secret);
 }
+
+function cache(ttlSec = 60) {
+  return async (req, res, next) => {
+    // Só GET idempotente
+    if (req.method !== "GET" || !redis) return next();
+
+    const key = redisKey(`cache:${req.method}:${req.originalUrl}`);
+    try {
+      const hit = await redis.get(key);
+      if (hit) {
+        res.set("X-Cache", "HIT");
+        res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+        return res.type("application/json").send(hit);
+      }
+    } catch (e) {
+      console.warn("Redis indisponível, seguindo sem cache:", e.message);
+    }
+
+    // Patch no send para escrever no cache após a resposta
+    const originalSend = res.send.bind(res);
+    res.send = async (body) => {
+      try {
+        if (res.statusCode === 200 && redis) {
+          // garante string (res.json envia objeto)
+          const payload = typeof body === "string" ? body : JSON.stringify(body);
+          await redis.set(key, payload, "EX", ttlSec);
+        }
+      } catch {}
+      res.set("X-Cache", "MISS");
+      return originalSend(body);
+    };
+
+    next();
+  };
+}
+
+async function invalidateProductsCache() {
+  if (!redis) return;
+  const pattern = redisKey("cache:GET:/produtos*");
+  let cursor = "0";
+  const keys = [];
+  do {
+    const [next, batch] = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+    cursor = next;
+    if (batch.length) keys.push(...batch);
+  } while (cursor !== "0");
+  if (keys.length) await redis.del(keys);
+}
+
 
 
 // ------------------- INICIALIZA -------------------
