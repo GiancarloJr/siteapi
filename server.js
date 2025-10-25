@@ -6,27 +6,65 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import Redis from "ioredis";
 
-const REDIS_URL = process.env.CACHETOGO_TLS_URL || process.env.CACHETOGO_URL;
-
-const useTls = REDIS_URL?.startsWith("rediss://");
-export const redis = REDIS_URL
-  ? new Redis(REDIS_URL, useTls ? { tls: { rejectUnauthorized: false } } : {})
-  : null;
-
-if (redis) {
-  redis.on("connect", () => console.log("✅ Redis conectado"));
-  redis.on("error", (e) => console.error("❌ Redis erro:", e));
-} else {
-  console.warn(
-    "⚠️  Redis desativado (nenhuma REDIS_URL/CACHETOGO_* no ambiente)."
-  );
-}
-
-const redisKey = (k) => `camaleao:${k}`;
+dotenv.config();
 
 const { Pool } = pkg;
 
-dotenv.config();
+/** ===== Redis com TLS + SNI + IPv4 + retry/backoff ===== */
+function createRedis() {
+  const urlStr =
+    process.env.CACHETOGO_TLS_URL ||  // rediss://...:443
+    process.env.CACHETOGO_URL ||      // redis:// (fallback)
+    process.env.REDIS_URL || null;
+
+  if (!urlStr) return null;
+
+  const u = new URL(urlStr);
+  const isTls = u.protocol === "rediss:";
+
+  const opts = {
+    host: u.hostname,
+    port: Number(u.port || (isTls ? 6380 : 6379)),
+    username: u.username || undefined,
+    password: u.password || undefined,
+
+    family: 4,                 // ✅ força IPv4
+    connectTimeout: 10000,
+    keepAlive: 10000,
+    lazyConnect: false,
+
+    retryStrategy: (times) => Math.min(times * 500, 5000),
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
+
+    // ✅ TLS com SNI (servername) evita ECONNRESET em :443
+    tls: isTls ? { rejectUnauthorized: false, servername: u.hostname } : undefined,
+  };
+
+  return new Redis(opts);
+}
+
+export const redis = createRedis();
+
+if (redis) {
+  console.log(
+    "Redis URL ativa:",
+    process.env.CACHETOGO_TLS_URL ? "CACHETOGO_TLS_URL" :
+    process.env.CACHETOGO_URL ? "CACHETOGO_URL" :
+    process.env.REDIS_URL ? "REDIS_URL" : "NENHUMA"
+  );
+  redis.on("connect", () => console.log("✅ Redis conectado"));
+  redis.on("ready",   () => console.log("✅ Redis pronto"));
+  redis.on("error",   (e) => {
+    if (e?.code === "ECONNRESET") return; // silencia reset por idle
+    console.error("❌ Redis erro:", e.message);
+  });
+  redis.on("end",     () => console.warn("⚠️  Redis desconectado"));
+} else {
+  console.warn("⚠️  Redis desativado (nenhuma URL no ambiente).");
+}
+
+const redisKey = (k) => `camaleao:${k}`;
 
 const app = express();
 
@@ -37,14 +75,11 @@ const ALLOWED_ORIGINS = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("CORS: Origin não permitido"));
-    }
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) callback(null, true);
+    else callback(new Error("CORS: Origin não permitido"));
   },
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type", "x-api-key"],
+  allowedHeaders: ["Authorization", "Content-Type"], 
   maxAge: 86400,
 };
 
