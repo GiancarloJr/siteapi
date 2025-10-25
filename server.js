@@ -4,25 +4,6 @@ import dotenv from "dotenv";
 import pkg from "pg";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import Redis from "ioredis";
-
-const REDIS_URL = process.env.CACHETOGO_TLS_URL || process.env.CACHETOGO_URL;
-
-const useTls = REDIS_URL?.startsWith("rediss://");
-export const redis = REDIS_URL
-  ? new Redis(REDIS_URL, useTls ? { tls: { rejectUnauthorized: false } } : {})
-  : null;
-
-if (redis) {
-  redis.on("connect", () => console.log("✅ Redis conectado"));
-  redis.on("error", (e) => console.error("❌ Redis erro:", e));
-} else {
-  console.warn(
-    "⚠️  Redis desativado (nenhuma REDIS_URL/CACHETOGO_* no ambiente)."
-  );
-}
-
-const redisKey = (k) => `camaleao:${k}`;
 
 const { Pool } = pkg;
 
@@ -131,7 +112,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-app.get("/produtos", cache(60), async (_req, res) => {
+app.get("/produtos", async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT p.id, p.titulo, p.preco, p.descricao, p.tamanhos, p.imagem_base64,
@@ -148,7 +129,7 @@ app.get("/produtos", cache(60), async (_req, res) => {
   }
 });
 
-app.get("/produtos/:id", cache(60), async (req, res) => {
+app.get("/produtos/:id", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM produtos WHERE id=$1", [
       req.params.id,
@@ -301,7 +282,7 @@ app.patch("/produtos/:id", async (req, res) => {
   }
 });
 
-app.get("/categorias/:id/produtos", cache(300),async (req, res) => {
+app.get("/categorias/:id/produtos", async (req, res) => {
   try {
     const categoriaId = Number(req.params.id);
     if (isNaN(categoriaId)) {
@@ -374,7 +355,7 @@ app.delete("/produtos/:id", async (req, res) => {
   }
 });
 
-app.get("/categorias", cache(60), async (_req, res) => {
+app.get("/categorias", async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, nome, path, href
@@ -407,54 +388,6 @@ function signToken(payload) {
 function verifyToken(token) {
   const secret = process.env.JWT_SECRET;
   return jwt.verify(token, secret);
-}
-
-function cache(ttlSec = 60) {
-  return async (req, res, next) => {
-    // Só GET idempotente
-    if (req.method !== "GET" || !redis) return next();
-
-    const key = redisKey(`cache:${req.method}:${req.originalUrl}`);
-    try {
-      const hit = await redis.get(key);
-      if (hit) {
-        res.set("X-Cache", "HIT");
-        res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
-        return res.type("application/json").send(hit);
-      }
-    } catch (e) {
-      console.warn("Redis indisponível, seguindo sem cache:", e.message);
-    }
-
-    // Patch no send para escrever no cache após a resposta
-    const originalSend = res.send.bind(res);
-    res.send = async (body) => {
-      try {
-        if (res.statusCode === 200 && redis) {
-          // garante string (res.json envia objeto)
-          const payload = typeof body === "string" ? body : JSON.stringify(body);
-          await redis.set(key, payload, "EX", ttlSec);
-        }
-      } catch {}
-      res.set("X-Cache", "MISS");
-      return originalSend(body);
-    };
-
-    next();
-  };
-}
-
-async function invalidateProductsCache() {
-  if (!redis) return;
-  const pattern = redisKey("cache:GET:/produtos*");
-  let cursor = "0";
-  const keys = [];
-  do {
-    const [next, batch] = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
-    cursor = next;
-    if (batch.length) keys.push(...batch);
-  } while (cursor !== "0");
-  if (keys.length) await redis.del(keys);
 }
 
 
