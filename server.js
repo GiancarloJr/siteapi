@@ -4,10 +4,19 @@ import dotenv from "dotenv";
 import pkg from "pg";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import { randomUUID } from "crypto";
+import { v2 as cloudinary } from "cloudinary";
 
 const { Pool } = pkg;
 
 dotenv.config();
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
 
 const app = express();
 
@@ -156,129 +165,167 @@ app.post("/produtos", async (req, res) => {
       categoria_id,
     } = req.body;
 
-    // validação básica
     if (!titulo || categoria_id == null) {
       return res
         .status(400)
         .json({ error: "Título e categoria_id são obrigatórios." });
     }
 
-    // (opcional) validar existência da categoria
     const { rows: catRows } = await pool.query(
       "SELECT 1 FROM categorias WHERE id = $1",
       [categoria_id]
     );
-    if (catRows.length === 0) {
+    if (!catRows.length)
       return res.status(400).json({ error: "Categoria inexistente." });
+
+    const tamanhosArray =
+      Array.isArray(tamanhos) && tamanhos.length
+        ? tamanhos.map((s) => String(s).trim()).filter(Boolean)
+        : null;
+
+    const precoNum =
+      preco === null || preco === undefined || preco === ""
+        ? null
+        : Number(preco);
+    if (precoNum !== null && Number.isNaN(precoNum))
+      return res.status(400).json({ error: "Preço inválido." });
+
+    if (!href && !imagem_base64) {
+      return res
+        .status(400)
+        .json({ error: "Envie 'href' ou 'imagem_base64'." });
     }
 
-    // garantir array de tamanhos (ou null)
-    const tamanhosArray = Array.isArray(tamanhos) ? tamanhos : null;
+    let finalHref = href ?? null;
+    if (!finalHref && imagem_base64) {
+      const { secureUrl } = await uploadDataUrlToCloudinary(imagem_base64);
+      finalHref = secureUrl;
+    }
 
-    const result = await pool.query(
-      `INSERT INTO produtos (
-         titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id, titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id`,
+    const valorFormatado =
+      valor_formatado ?? (precoNum != null ? precoNum.toFixed(2) : null);
+
+    const insert = await pool.query(
+      `INSERT INTO produtos (titulo, preco, descricao, tamanhos, imagem_base64, valor_formatado, href, categoria_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id`,
       [
         titulo,
-        preco,
-        descricao,
+        precoNum,
+        descricao ?? null,
         tamanhosArray,
-        imagem_base64,
-        valor_formatado,
-        href,
+        null,
+        valorFormatado,
+        finalHref,
         categoria_id,
       ]
     );
 
-    // se quiser já devolver a categoria junto, faça um JOIN após inserir:
     const { rows } = await pool.query(
       `SELECT p.*, c.nome AS categoria_nome, c.href AS categoria_href, c.path AS categoria_path
          FROM produtos p
          JOIN categorias c ON c.id = p.categoria_id
         WHERE p.id = $1`,
-      [result.rows[0].id]
+      [insert.rows[0].id]
     );
 
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro ao criar produto" });
-  } finally {
-    invalidateProductsCache().catch(() => {});
   }
 });
 
 app.patch("/produtos/:id", async (req, res) => {
   try {
-    const id = req.params.id;
-    const fields = [
-      "titulo",
-      "preco",
-      "descricao",
-      "tamanhos",
-      "imagem_base64",
-      "valor_formatado",
-      "href",
-      "categoria_id",
-    ];
+    const id = Number(req.params.id);
+    if (Number.isNaN(id))
+      return res.status(400).json({ error: "ID inválido." });
 
-    if (req.body.categoria_id !== undefined) {
-      const { rows: cat } = await pool.query(
-        "SELECT 1 FROM categorias WHERE id = $1",
-        [req.body.categoria_id]
-      );
-      if (!cat.length) {
-        return res.status(400).json({ error: "Categoria inexistente." });
-      }
+    const { rows: existingRows } = await pool.query(
+      "SELECT * FROM produtos WHERE id = $1",
+      [id]
+    );
+    if (!existingRows.length)
+      return res.status(404).json({ error: "Produto não encontrado." });
+
+    let {
+      titulo,
+      preco,
+      descricao,
+      tamanhos,
+      imagem_base64, // se vier, substitui imagem
+      valor_formatado,
+      href, // se vier e não houver base64, atualiza
+      categoria_id,
+    } = req.body;
+
+    // normalizações
+    const fields = {};
+    if (titulo !== undefined) fields.titulo = String(titulo);
+    if (preco !== undefined) {
+      const n = preco === null || preco === "" ? null : Number(preco);
+      if (n !== null && Number.isNaN(n))
+        return res.status(400).json({ error: "Preço inválido." });
+      fields.preco = n;
+    }
+    if (descricao !== undefined) fields.descricao = descricao ?? null;
+    if (tamanhos !== undefined) {
+      fields.tamanhos =
+        Array.isArray(tamanhos) && tamanhos.length
+          ? tamanhos.map((s) => String(s).trim()).filter(Boolean)
+          : null;
+    }
+    if (categoria_id !== undefined) fields.categoria_id = categoria_id ?? null;
+
+    // imagem: se veio base64, sobrepõe; senão, se veio href, usa href
+    if (imagem_base64) {
+      const { secureUrl } = await uploadDataUrlToCloudinary(imagem_base64);
+      fields.href = secureUrl;
+      fields.imagem_base64 = null; // nunca persistimos base64
+    } else if (href !== undefined) {
+      fields.href = href || null;
+      fields.imagem_base64 = null;
     }
 
+    if (valor_formatado !== undefined) {
+      fields.valor_formatado = valor_formatado ?? null;
+    } else if (fields.preco !== undefined) {
+      fields.valor_formatado =
+        fields.preco != null ? fields.preco.toFixed(2) : null;
+    }
+
+    // monta UPDATE dinâmico
     const set = [];
     const values = [];
-
-    fields.forEach((f) => {
-      if (req.body[f] !== undefined) {
-        set.push(`${f}=$${values.length + 1}`);
-        values.push(req.body[f]);
-      }
+    Object.entries(fields).forEach(([k, v]) => {
+      set.push(`${k}=$${values.length + 1}`);
+      values.push(v);
     });
 
-    if (set.length === 0)
-      return res.status(400).json({ error: "Nenhum campo para atualizar" });
+    if (!set.length)
+      return res.status(400).json({ error: "Nenhum campo para atualizar." });
 
     values.push(id);
+    const query = `UPDATE produtos SET ${set.join(", ")} WHERE id=$${
+      values.length
+    } RETURNING *`;
+    const result = await pool.query(query, values);
 
-    const query = `
-      UPDATE produtos
-         SET ${set.join(", ")}
-       WHERE id = $${values.length}
-       RETURNING id, titulo, preco, descricao, tamanhos, imagem_base64,
-                 valor_formatado, href, categoria_id, ativo
-    `;
-    const updated = await pool.query(query, values);
-
-    if (!updated.rows.length) {
-      return res.status(404).json({ error: "Produto não encontrado" });
-    }
+    const updated = result.rows[0];
 
     const { rows } = await pool.query(
-      `SELECT p.*,
-              c.nome AS categoria_nome,
-              c.href AS categoria_href,
-              c.path AS categoria_path
+      `SELECT p.*, c.nome AS categoria_nome, c.href AS categoria_href, c.path AS categoria_path
          FROM produtos p
-    LEFT JOIN categorias c ON c.id = p.categoria_id
+         JOIN categorias c ON c.id = p.categoria_id
         WHERE p.id = $1`,
-      [updated.rows[0].id]
+      [updated.id]
     );
 
-    return res.json(rows[0]);
+    res.json(rows[0]);
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Erro ao atualizar produto" });
-  } finally {
-    invalidateProductsCache().catch(() => {});
+    res.status(500).json({ error: "Erro ao atualizar produto" });
   }
 });
 
@@ -333,8 +380,6 @@ app.patch("/produtos/:id/ativo", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Erro ao alterar ativo" });
-  } finally {
-    invalidateProductsCache().catch(() => {});
   }
 });
 
@@ -350,8 +395,6 @@ app.delete("/produtos/:id", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Erro ao excluir" });
-  } finally {
-    invalidateProductsCache().catch(() => {});
   }
 });
 
@@ -390,7 +433,24 @@ function verifyToken(token) {
   return jwt.verify(token, secret);
 }
 
+async function uploadDataUrlToCloudinary(dataUrl) {
+  if (!/^data:image\/(png|jpe?g|webp);base64,/i.test(dataUrl || "")) {
+    throw new Error("Formato de imagem inválido. Envie uma Data URL base64.");
+  }
 
+  const publicId = `camaleao/produtos/${randomUUID()}`; // nome único
+  const result = await cloudinary.uploader.upload(dataUrl, {
+    folder: "camaleao/produtos",
+    public_id: publicId.split("/").pop(),
+    overwrite: false,
+    invalidate: false,
+    resource_type: "image",
+    // otimização automática no delivery
+    transformation: [{ fetch_format: "auto", quality: "auto" }],
+  });
+
+  return { secureUrl: result.secure_url, publicId: result.public_id };
+}
 
 // ------------------- INICIALIZA -------------------
 
