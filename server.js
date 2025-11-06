@@ -21,6 +21,7 @@ cloudinary.config({
 const app = express();
 
 const ALLOWED_ORIGINS = [
+  "https://www.camaleaostorerv.com.br",
   "https://sitefabi.vercel.app",
   "http://localhost:4200",
 ];
